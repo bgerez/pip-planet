@@ -1,0 +1,13 @@
+# Ignorar archivos grandes
+*.zip
+.terraform/
+*.tfstate
+*.tfstate.backup
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.venv/
+*.log
