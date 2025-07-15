@@ -1,0 +1,2 @@
+convert/.terraform/** filter=lfs diff=lfs merge=lfs -text
+unzip/.terraform/** filter=lfs diff=lfs merge=lfs -text
