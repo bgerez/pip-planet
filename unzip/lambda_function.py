@@ -1,189 +1,144 @@
-import boto3
-import os
-import zipfile
-import uuid
 import json
+import os
+import uuid
+import boto3
 import logging
-import time
-import shutil  # 👈 para eliminar carpetas recursivamente
+import shutil  # Necesario para eliminar carpetas recursivamente
+from pathlib import Path
+from botocore.config import Config
+import zipfile  # ¡Importante! Faltaba importar zipfile
 
-# Configurar logging
+# === Configuración inicial ===
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Clientes AWS
-s3 = boto3.client('s3')
-sns = boto3.client('sns')
+# Configuración de timeout para evitar esperas largas
+config = Config(connect_timeout=10, read_timeout=10)
 
-# Variables de entorno
-SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
-MAX_SIZE_MB = int(os.environ.get('MAX_TOTAL_UNZIPPED_SIZE_MB', 20480))
-MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024
+s3 = boto3.client("s3", config=config, region_name="us-west-2")
+sns = boto3.client("sns", config=config, region_name="us-west-2")
 
-# Retardos para reintento (si el archivo aún no está listo)
-MAX_RETRIES = 3
-RETRY_DELAY = 5  # segundos
+SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN")
+EFS_BASE_DIR = os.environ.get("EFS_BASE_DIR", "/mnt/efs/lambda-unzip")
+logger.info(f"Usando EFS base dir: {EFS_BASE_DIR}")
 
 
 def lambda_handler(event, context):
-    for record in event.get('Records', []):
-        tmp_zip_path = None
-        extract_dir = None
+    logger.info("Inicio de ejecución de Lambda unzip")
+
+    for record in event.get("Records", []):
+        # Inicializar la variable para la carpeta temporal
+        unzip_dir = None
 
         try:
-            # Parsear el evento SQS
-            try:
-                sqs_body = json.loads(record['body'])
-                if 'detail' in sqs_body:
-                    detail = sqs_body['detail']
+            # --- Determinar tipo de evento ---
+            message = None
+
+            if record.get("eventSource") == "aws:sqs":
+                logger.info("Evento recibido desde SQS")
+                body = json.loads(record["body"])
+                if isinstance(body.get("Message"), str):
+                    message = json.loads(body["Message"])
                 else:
-                    message = sqs_body.get('Message', '{}')
-                    nested = json.loads(message)
-                    detail = nested.get('detail', {})
-            except Exception as e:
-                logger.error(f"Error al parsear evento SQS: {str(e)}")
-                raise
-
-            bucket = detail.get('bucket', {}).get('name')
-            key = detail.get('object', {}).get('key')
-
-            if not bucket or not key:
-                logger.error("Evento malformado: falta bucket o key")
+                    message = body
+            elif record.get("EventSource") == "aws:sns" or "Sns" in record:
+                logger.info("Evento recibido desde SNS")
+                message = json.loads(record["Sns"]["Message"])
+            elif record.get("eventSource") == "aws:s3":
+                logger.info("Evento recibido directamente desde S3")
+                message = record
+            else:
+                logger.warning("Tipo de evento no reconocido")
                 continue
 
-            logger.info(f"Procesando archivo ZIP: s3://{bucket}/{key}")
+            # --- Obtener bucket y key ---
+            detail = message.get("detail", {})
+            bucket = detail.get("bucket", {}).get("name", message.get("bucket"))
+            key = detail.get("object", {}).get("key", message.get("key"))
 
-            # Validar que el objeto existe
-            file_size = None
-            for attempt in range(1, MAX_RETRIES + 1):
-                try:
-                    head = s3.head_object(Bucket=bucket, Key=key)
-                    file_size = head['ContentLength']
-                    if file_size > 0:
-                        logger.info(f"Archivo listo para descargar. Tamaño: {file_size} bytes")
-                        break
-                    else:
-                        logger.warning(f"Intento {attempt}: archivo {key} con tamaño 0")
-                except Exception as e:
-                    logger.warning(f"Intento {attempt}: error al verificar objeto: {str(e)}")
+            if not bucket or not key:
+                logger.warning("No se pudo obtener bucket y key")
+                continue
 
-                if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY)
-                else:
-                    raise Exception(f"Archivo no disponible luego de {MAX_RETRIES} intentos")
+            # Eliminar espacios o caracteres extraños
+            key = key.strip()
+            logger.info(f"Bucket: {bucket}")
+            logger.info(f"Key del ZIP: {key}")
+            s3_path = f"s3://{bucket}/{key}"
+            logger.info(f"Verificando disponibilidad del archivo: {s3_path}")
 
-            # Descargar archivo
-            tmp_zip_path = f"/tmp/{uuid.uuid4()}.zip"
-            logger.info(f"Descargando {key} a {tmp_zip_path}")
-            s3.download_file(bucket, key, tmp_zip_path)
+            # --- Crear carpeta de trabajo en EFS ---
+            unzip_dir = Path(EFS_BASE_DIR) / str(uuid.uuid4())
+            unzip_dir.mkdir(parents=True, exist_ok=True)
 
-            # Validar ZIP
-            logger.info("Validando ZIP...")
-            with zipfile.ZipFile(tmp_zip_path, 'r') as zip_ref:
-                corrupt_file = zip_ref.testzip()
-                if corrupt_file:
-                    raise Exception(f"Archivo ZIP corrupto: {corrupt_file}")
+            # --- Descargar ZIP al EFS ---
+            tmp_zip_path = unzip_dir / "archivo.zip"
+            s3.download_file(bucket, key, str(tmp_zip_path))
+            logger.info(f"ZIP descargado en {tmp_zip_path}")
 
-            extract_dir = f"/tmp/{uuid.uuid4()}-unzipped"
-            os.makedirs(extract_dir, exist_ok=True)
-
+            # --- Descomprimir archivos en EFS ---
             extracted_files = []
-            skipped_files = []
-            tiff_files = []
-            total_unzipped_size = 0
+            with zipfile.ZipFile(tmp_zip_path, "r") as zip_ref:
+                zip_ref.extractall(unzip_dir)
+                extracted_files = [f.lstrip("./") for f in zip_ref.namelist()]
 
-            with zipfile.ZipFile(tmp_zip_path, 'r') as zip_ref:
-                for file_info in zip_ref.infolist():
-                    if total_unzipped_size + file_info.file_size > MAX_SIZE_BYTES:
-                        logger.warning(f"Saltando archivo: {file_info.filename}")
-                        skipped_files.append({
-                            "filename": file_info.filename,
-                            "size_mb": round(file_info.file_size / (1024 * 1024), 2),
-                            "reason": "exceeds_max_total_unzipped_size"
-                        })
-                        continue
+            logger.info(f"Archivos extraídos: {extracted_files}")
 
-                    zip_ref.extract(file_info, extract_dir)
-                    total_unzipped_size += file_info.file_size
+            # --- Subir archivos a S3 ---
+            output_prefix = os.path.splitext(key)[0]  # Ej: "2025/Risaralda/..."
+            uploaded_files = []
 
-                    rel_path = file_info.filename
-                    s3_key = f"{key.replace('.zip', '')}/{rel_path}"
+            for filename in extracted_files:
+                local_path = unzip_dir / filename
+                if local_path.is_file():
+                    s3_key = f"{output_prefix}/{filename}"
+                    s3.upload_file(str(local_path), bucket, s3_key)
+                    uploaded_files.append(s3_key)
 
-                    local_file = os.path.join(extract_dir, rel_path)
-                    logger.info(f"Subiendo {s3_key} a S3")
-                    s3.upload_file(local_file, bucket, s3_key)
-                    extracted_files.append(s3_key)
+            logger.info(f"Archivos subidos a S3: {uploaded_files}")
 
-                    if file_info.filename.lower().endswith(('.tif', '.tiff')):
-                        tiff_files.append(s3_key)
+            uploaded_tif_files = [f for f in uploaded_files if f.lower().endswith(".tif")]
 
-            # Metadata
-            unzip_folder = key.replace(".zip", "")
-            unpacked_info = {
-                "unpacked_to": f"{unzip_folder}/",
-                "files": sorted(tiff_files)
-            }
-            unpacked_info_key = f"{unzip_folder}/unpacked_info.json"
-            logger.info(f"Subiendo metadata: {unpacked_info_key}")
-            try:
-                s3.put_object(
-                    Bucket=bucket,
-                    Key=unpacked_info_key,
-                    Body=json.dumps(unpacked_info, indent=2),
-                    ContentType="application/json"
-                )
-            except Exception as e:
-                logger.error(f"Error al subir metadata: {str(e)}")
-
-            # Notificación SNS
-            success_message = {
-                "status": "success",
-                "bucket": bucket,
-                "original_zip": key,
-                "unzipped_to": unzip_folder,
-                "total_extracted_files": len(extracted_files),
-                "total_skipped_files": len(skipped_files),
-                "total_size_mb": round(total_unzipped_size / (1024 * 1024), 2),
-                "extracted_files": sorted(extracted_files),
-                "skipped_files": skipped_files,
-                "tiff_files": sorted(tiff_files)
+            # --- Guardar resumen JSON en nuevo formato ---
+            unpacked_to = f"{output_prefix}/"
+            resumen = {
+                "unpacked_to": unpacked_to,
+                "files": uploaded_tif_files
             }
 
-            sns.publish(
-                TopicArn=SNS_TOPIC_ARN,
-                Subject=f"✅ ZIP procesado: {os.path.basename(key)}",
-                Message=json.dumps(success_message, indent=2)
-            )
+            resumen_path = unzip_dir / "unpacked_info.json"
+            with open(resumen_path, "w", encoding="utf-8") as f:
+                json.dump(resumen, f, indent=2, ensure_ascii=False)
 
-            logger.info(f"Procesado exitosamente: {key}")
+            resumen_s3_key = f"{output_prefix}/unpacked_info.json"
+            s3.upload_file(str(resumen_path), bucket, resumen_s3_key)
+            logger.info(f"Resumen guardado como: s3://{bucket}/{resumen_s3_key}")
+
+            # --- Publicar a SNS ---
+            if SNS_TOPIC_ARN:
+                try:
+                    sns.publish(
+                        TopicArn=SNS_TOPIC_ARN,
+                        Subject="unzip-complete",
+                        Message=json.dumps(resumen)
+                    )
+                    logger.info(f"Publicado resumen a SNS: {SNS_TOPIC_ARN}")
+                except Exception as e:
+                    logger.exception(f"Error al publicar en SNS: {e}")
+            else:
+                logger.warning("SNS_TOPIC_ARN no está definido")
 
         except Exception as e:
-            logger.exception(f"Error en la ejecución principal: {str(e)}")
-            error_message = {
-                "status": "error",
-                "bucket": bucket,
-                "key": key,
-                "error": str(e),
-                "event_id": record.get('eventID')
-            }
-            try:
-                sns.publish(
-                    TopicArn=SNS_TOPIC_ARN,
-                    Subject=f"❌ ERROR al procesar ZIP: {os.path.basename(key)}",
-                    Message=json.dumps(error_message, indent=2)
-                )
-            except Exception as sns_error:
-                logger.error(f"Error al enviar mensaje SNS de error: {str(sns_error)}")
-            raise
-
+            logger.exception(f"Error procesando el evento: {e}")
         finally:
-            # 🧹 Eliminar archivos temporales si existen
-            if tmp_zip_path and os.path.exists(tmp_zip_path):
-                os.remove(tmp_zip_path)
-                logger.info(f"Eliminado archivo ZIP temporal: {tmp_zip_path}")
+            # === Eliminar carpeta temporal en EFS si fue creada ===
+            if unzip_dir and unzip_dir.exists():
+                try:
+                    logger.info(f"Eliminando carpeta temporal: {unzip_dir}")
+                    shutil.rmtree(unzip_dir)  # Elimina recursivamente
+                    logger.info(f"Carpeta temporal eliminada: {unzip_dir}")
+                except Exception as e:
+                    logger.error(f"No se pudo eliminar la carpeta temporal {unzip_dir}: {e}")
 
-            if extract_dir and os.path.exists(extract_dir):
-                shutil.rmtree(extract_dir, ignore_errors=True)
-                logger.info(f"Eliminado directorio descomprimido temporal: {extract_dir}")
-
-    return {"statusCode": 200, "body": "Procesado"}
+    logger.info("Fin de ejecución Lambda unzip")
+    return {"statusCode": 200, "body": "Procesamiento completado"}

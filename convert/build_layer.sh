@@ -11,7 +11,7 @@ docker build -t lambda-rasterio-layer .
 docker create --name temp_container lambda-rasterio-layer
 
 # Extraer el ZIP
-docker cp temp_container:/layer/lambda_rasterio_layer.zip ./lambda_rasterio_layer.zip
+docker cp temp_container:/var/task/lambda_rasterio_layer.zip ./lambda_rasterio_layer.zip
 
 # Eliminar contenedor temporal
 docker rm temp_container

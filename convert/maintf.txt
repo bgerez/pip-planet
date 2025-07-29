@@ -2,9 +2,13 @@ provider "aws" {
   region = "us-west-2"
 }
 
-# --- IAM Role for Lambda ---
+#######################
+# IAM Role for Lambda #
+#######################
+
 resource "aws_iam_role" "cog_lambda_role" {
   name = "lambda-cog-role"
+
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -19,9 +23,13 @@ resource "aws_iam_role" "cog_lambda_role" {
   })
 }
 
-# --- IAM Policy for Lambda ---
+#########################
+# IAM Policy for Lambda #
+#########################
+
 resource "aws_iam_policy" "cog_lambda_policy" {
-  name = "lambda-cog-s3-efs-policy"
+  name = "lambda-cog-s3-policy"
+
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -44,36 +52,24 @@ resource "aws_iam_policy" "cog_lambda_policy" {
           "logs:PutLogEvents"
         ]
         Resource = "arn:aws:logs:*:*:*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "ec2:CreateNetworkInterface",
-          "ec2:DescribeNetworkInterfaces",
-          "ec2:DeleteNetworkInterface"
-        ]
-        Resource = "*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "elasticfilesystem:ClientMount",
-          "elasticfilesystem:ClientWrite",
-          "elasticfilesystem:ClientRootAccess"
-        ]
-        Resource = "arn:aws:elasticfilesystem:us-west-2:757337303035:file-system/fs-088b9b6791928acef"
       }
     ]
   })
 }
 
-# --- Attach Policy to Role ---
+######################################
+# Attach Policy to the Lambda Role   #
+######################################
+
 resource "aws_iam_role_policy_attachment" "cog_lambda_policy_attach" {
   role       = aws_iam_role.cog_lambda_role.name
   policy_arn = aws_iam_policy.cog_lambda_policy.arn
 }
 
-# --- Lambda Layer: rasterio + GDAL ---
+####################
+# Lambda Layer     #
+####################
+
 resource "aws_lambda_layer_version" "rasterio_layer" {
   filename            = "${path.module}/lambda_rasterio_layer.zip"
   layer_name          = "rasterio-cogeo-layer"
@@ -81,7 +77,10 @@ resource "aws_lambda_layer_version" "rasterio_layer" {
   source_code_hash    = filebase64sha256("${path.module}/lambda_rasterio_layer.zip")
 }
 
-# --- CloudWatch Log Group ---
+#########################
+# CloudWatch Log Group  #
+#########################
+
 resource "aws_cloudwatch_log_group" "cog_lambda_log_group" {
   name              = "/aws/lambda/convert-to-cog"
   retention_in_days = 14
@@ -91,45 +90,32 @@ resource "aws_cloudwatch_log_group" "cog_lambda_log_group" {
   }
 }
 
-# --- SNS Topic ---
+#########################
+# SNS Topic: Notificaciones
+#########################
+
 resource "aws_sns_topic" "cog_summary" {
   name = "cog-summary-topic"
 }
 
-# === DATA SOURCES: Recursos existentes (del módulo unzip) ===
+# (Opcional) Suscripción por email
+# resource "aws_sns_topic_subscription" "cog_email_sub" {
+#   topic_arn = aws_sns_topic.cog_summary.arn
+#   protocol  = "email"
+#   endpoint  = "bgerez@procalculo.com"
+# }
 
-data "aws_vpc" "lambda_vpc" {
-  id = "vpc-07b821c54b54dc567"
-}
+#########################
+# Lambda Function: COG  #
+#########################
 
-data "aws_subnet" "lambda_subnet_a" {
-  id = "subnet-048013f25ea982214"
-}
-
-data "aws_subnet" "lambda_subnet_b" {
-  id = "subnet-085d21e3a05bc440c"
-}
-
-data "aws_security_group" "lambda_sg" {
-  id = "sg-00e7768d80846863d"
-}
-
-data "aws_efs_file_system" "lambda_efs" {
-  file_system_id = "fs-088b9b6791928acef"
-}
-
-data "aws_efs_access_point" "lambda_ap" {
-  access_point_id = "fsap-0864fd7670259a39e"
-}
-
-# --- Lambda Function: convert-to-cog (en VPC + EFS) ---
 resource "aws_lambda_function" "cog_lambda" {
   function_name = "convert-to-cog"
   role          = aws_iam_role.cog_lambda_role.arn
   handler       = "lambda_function.lambda_handler"
   runtime       = "python3.11"
   timeout       = 900
-  memory_size   = 3072
+  memory_size   = 3072  # Aumentado para manejar archivos grandes
   publish       = true
 
   filename         = "${path.module}/lambda_cog_package.zip"
@@ -140,7 +126,7 @@ resource "aws_lambda_function" "cog_lambda" {
   ]
 
   ephemeral_storage {
-    size = 10240 # 10 GB
+    size = 10240  # 10 GB
   }
 
   environment {
@@ -154,26 +140,18 @@ resource "aws_lambda_function" "cog_lambda" {
     log_format = "Text"
     log_group  = aws_cloudwatch_log_group.cog_lambda_log_group.name
   }
-
-  # === VPC Configuration ===
-  vpc_config {
-    subnet_ids         = [data.aws_subnet.lambda_subnet_a.id, data.aws_subnet.lambda_subnet_b.id]
-    security_group_ids = [data.aws_security_group.lambda_sg.id]
-  }
-
-  # === EFS Mount ===
-  file_system_config {
-    arn              = data.aws_efs_access_point.lambda_ap.arn
-    local_mount_path = "/mnt/efs"
-  }
 }
 
-# --- EventBridge Rule: Dispara cuando se crea unpacked_info.json ---
+#########################
+# EventBridge Rule      #
+# Dispara cuando se crea unpacked_info.json
+#########################
+
 resource "aws_cloudwatch_event_rule" "cog_trigger_rule" {
   name        = "invoke-cog-on-unpacked-info"
   description = "Trigger convert-to-cog when unpacked_info.json is created"
   event_pattern = jsonencode({
-    source        = ["aws.s3"]
+    source      = ["aws.s3"]
     "detail-type" = ["Object Created"]
     detail = {
       bucket = {
@@ -189,8 +167,8 @@ resource "aws_cloudwatch_event_rule" "cog_trigger_rule" {
 }
 
 resource "aws_cloudwatch_event_target" "cog_lambda_target" {
-  rule = aws_cloudwatch_event_rule.cog_trigger_rule.name
-  arn  = aws_lambda_function.cog_lambda.arn
+  rule      = aws_cloudwatch_event_rule.cog_trigger_rule.name
+  arn       = aws_lambda_function.cog_lambda.arn
 }
 
 resource "aws_lambda_permission" "allow_eventbridge_cog" {
